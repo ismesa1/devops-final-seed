@@ -1,6 +1,9 @@
+import json
+import logging
 import sqlite3
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -168,3 +171,32 @@ def test_metrics_endpoint_is_available(client):
     assert response.status_code == 200
     assert "text/plain" in response.content_type
     assert "flask_exporter_info" in response.get_data(as_text=True)
+
+
+def test_json_formatter_includes_exception_field():
+    formatter = app_module.JsonFormatter()
+    try:
+        raise ValueError("boom")
+    except ValueError:
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="",
+            lineno=0,
+            msg="error occurred",
+            args=(),
+            exc_info=sys.exc_info(),
+        )
+    result = json.loads(formatter.format(record))
+    assert "exception" in result
+    assert "ValueError" in result["exception"]
+
+
+def test_health_endpoint_returns_503_when_db_fails(client):
+    with patch.object(app_module, "get_db", side_effect=sqlite3.Error("DB unavailable")):
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    data = response.get_json()
+    assert data["status"] == "error"
+    assert data["database"] == "error"
