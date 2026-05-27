@@ -1,0 +1,276 @@
+name: CI-CD
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+env:
+  NEXUS_REGISTRY: ${{ vars.NEXUS_REGISTRY }}
+  NEXUS_DOCKER_IMAGE: ${{ vars.NEXUS_DOCKER_IMAGE }}
+  NEXUS_RAW_URL: ${{ vars.NEXUS_RAW_URL }}
+  K8S_NAMESPACE: devops-final
+
+jobs:
+  quality-security-tests:
+    name: Quality, Security and Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create reports folder
+        run: mkdir -p reports
+
+      - name: Lint with Ruff
+        run: ruff check src tests
+
+      - name: Security scan with Bandit
+        run: bandit -r src -f json -o reports/bandit-report.json
+
+      - name: Dependency audit with pip-audit
+        run: pip-audit -r requirements.txt -f json -o reports/pip-audit-report.json
+
+      - name: Run tests with coverage
+        run: |
+          pytest -v \
+            --junitxml=reports/pytest-report.xml \
+            --cov=src \
+            --cov-report=xml:reports/coverage.xml \
+            --cov-report=html:htmlcov
+
+      - name: Package quality reports
+        if: always() && github.event_name != 'pull_request'
+        run: tar -czf quality-reports-${{ github.run_number }}.tar.gz reports htmlcov
+
+      - name: Upload quality reports to Nexus Raw
+        if: always() && github.event_name != 'pull_request'
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          BRANCH_OR_TAG="${GITHUB_REF_NAME//\//-}"
+          RAW_BASE="${NEXUS_RAW_URL%/}"
+          curl -f -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file quality-reports-${{ github.run_number }}.tar.gz \
+            "${RAW_BASE}/${{ github.repository }}/${BRANCH_OR_TAG}/quality-reports-${{ github.run_number }}.tar.gz"
+
+  verify-docker:
+    name: Verify Docker Configuration
+    runs-on: ubuntu-latest
+    needs: quality-security-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Validate Docker Compose file
+        run: docker compose config
+
+      - name: Build application image
+        run: docker build -t todo-api:ci -f Dockerfile .
+
+  verify-kubernetes:
+    name: Verify Kubernetes Manifests
+    runs-on: ubuntu-latest
+    needs: quality-security-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Validate Kubernetes manifests
+        run: |
+          kubectl apply --dry-run=client --validate=false -f k8s/namespace.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/todo-api-configmap.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/todo-api-pvc.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/todo-api-deployment.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/todo-api-service.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/todo-api-ingress.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/prometheus-configmap.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/prometheus-deployment.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/prometheus-service.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/grafana-secret.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/grafana-pvc.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/grafana-datasource-configmap.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/grafana-deployment.yaml
+          kubectl apply --dry-run=client --validate=false -f k8s/grafana-service.yaml
+
+  build-and-push-image:
+    name: Build and Push Container Image
+    runs-on: ubuntu-latest
+    needs:
+      - verify-docker
+      - verify-kubernetes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Docker daemon for insecure registry
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{
+            "insecure-registries": ["'"$NEXUS_REGISTRY"'"]
+          }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # Esperar a que el daemon esté listo
+          sleep 5
+
+      - name: Verify Docker daemon insecure registries
+        run: |
+          docker info --format '{{json .}}' | jq .InsecureRegistries
+          cat /etc/docker/daemon.json
+
+      - name: Log in to Nexus Docker Registry
+        run: |
+          echo "${{ secrets.NEXUS_PASSWORD }}" | docker login \
+            --username "${{ secrets.NEXUS_USERNAME }}" \
+            --password-stdin "${{ env.NEXUS_REGISTRY }}"
+
+      - name: Verify Nexus Docker endpoint
+        run: |
+          STATUS_CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
+            --connect-timeout 10 --max-time 20 \
+            "http://${{ env.NEXUS_REGISTRY }}/v2/")
+          echo "Nexus /v2/ HTTP status: ${STATUS_CODE}"
+          if [ "${STATUS_CODE}" != "200" ] && [ "${STATUS_CODE}" != "401" ]; then
+            echo "Unexpected status from registry endpoint"
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [registry."${{ env.NEXUS_REGISTRY }}"]
+              http = true
+              insecure = true
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.NEXUS_DOCKER_IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ env.NEXUS_DOCKER_IMAGE }}:sha-${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export image tags as artifact
+        run: |
+          mkdir -p reports
+          echo "${{ steps.meta.outputs.tags }}" > reports/image-tags.txt
+          echo "${{ env.NEXUS_DOCKER_IMAGE }}:sha-${{ github.sha }}" >> reports/image-tags.txt
+
+      - name: Upload image metadata to Nexus Raw
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          BRANCH_OR_TAG="${GITHUB_REF_NAME//\//-}"
+          RAW_BASE="${NEXUS_RAW_URL%/}"
+          curl -f -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            --upload-file reports/image-tags.txt \
+            "${RAW_BASE}/${{ github.repository }}/${BRANCH_OR_TAG}/image-tags-${{ github.run_number }}.txt"
+
+  deploy-kubernetes:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          CURRENT_CONTEXT="$(kubectl config current-context)"
+          CURRENT_CLUSTER="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="'"$CURRENT_CONTEXT"'")].context.cluster}')"
+          API_SERVER="$(kubectl config view -o jsonpath='{.clusters[?(@.name=="'"$CURRENT_CLUSTER"'")].cluster.server}')"
+          HTTP_API_SERVER="${API_SERVER/https:\/\//http://}"
+          kubectl config set-cluster "$CURRENT_CLUSTER" --server="$HTTP_API_SERVER"
+          kubectl config set-cluster "$CURRENT_CLUSTER" --insecure-skip-tls-verify=true
+          kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority-data" || true
+          kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority" || true
+          echo "Kubernetes API server configured as: $HTTP_API_SERVER"
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl -n "$K8S_NAMESPACE" create secret docker-registry nexus-regcred \
+            --docker-server="$NEXUS_REGISTRY" \
+            --docker-username="${{ secrets.NEXUS_USERNAME }}" \
+            --docker-password="${{ secrets.NEXUS_PASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f k8s/todo-api-configmap.yaml
+          kubectl apply -f k8s/todo-api-pvc.yaml
+          kubectl apply -f k8s/todo-api-deployment.yaml
+          kubectl apply -f k8s/todo-api-service.yaml
+          kubectl apply -f k8s/prometheus-configmap.yaml
+          kubectl apply -f k8s/prometheus-deployment.yaml
+          kubectl apply -f k8s/prometheus-service.yaml
+          kubectl apply -f k8s/grafana-secret.yaml
+          kubectl apply -f k8s/grafana-pvc.yaml
+          kubectl apply -f k8s/grafana-datasource-configmap.yaml
+          kubectl apply -f k8s/grafana-deployment.yaml
+          kubectl apply -f k8s/grafana-service.yaml
+
+      - name: Deploy image built in this run
+        run: |
+          IMAGE_REF="${NEXUS_DOCKER_IMAGE}:sha-${GITHUB_SHA}"
+          kubectl -n "$K8S_NAMESPACE" set image deployment/todo-api todo-api="$IMAGE_REF"
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment/todo-api --timeout=180s
