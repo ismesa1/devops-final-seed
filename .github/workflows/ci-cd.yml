@@ -116,12 +116,12 @@ jobs:
           CURRENT_CONTEXT="$(kubectl config current-context)"
           CURRENT_CLUSTER="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="'"$CURRENT_CONTEXT"'")].context.cluster}')"
           API_SERVER="$(kubectl config view -o jsonpath='{.clusters[?(@.name=="'"$CURRENT_CLUSTER"'")].cluster.server}')"
-          HTTP_API_SERVER="${API_SERVER/https:\/\//http://}"
-          kubectl config set-cluster "$CURRENT_CLUSTER" --server="$HTTP_API_SERVER"
+          kubectl config set-cluster "$CURRENT_CLUSTER" --server="$API_SERVER"
           kubectl config set-cluster "$CURRENT_CLUSTER" --insecure-skip-tls-verify=true
           kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority-data" || true
           kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority" || true
-          echo "Kubernetes API server configured as: $HTTP_API_SERVER"
+          echo "Kubernetes API server configured as: $API_SERVER"
+          kubectl cluster-info || true
 
       - name: Validate Kubernetes manifests
         run: |
@@ -256,12 +256,12 @@ jobs:
           CURRENT_CONTEXT="$(kubectl config current-context)"
           CURRENT_CLUSTER="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="'"$CURRENT_CONTEXT"'")].context.cluster}')"
           API_SERVER="$(kubectl config view -o jsonpath='{.clusters[?(@.name=="'"$CURRENT_CLUSTER"'")].cluster.server}')"
-          HTTP_API_SERVER="${API_SERVER/https:\/\//http://}"
-          kubectl config set-cluster "$CURRENT_CLUSTER" --server="$HTTP_API_SERVER"
+          kubectl config set-cluster "$CURRENT_CLUSTER" --server="$API_SERVER"
           kubectl config set-cluster "$CURRENT_CLUSTER" --insecure-skip-tls-verify=true
           kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority-data" || true
           kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority" || true
-          echo "Kubernetes API server configured as: $HTTP_API_SERVER"
+          echo "Kubernetes API server configured as: $API_SERVER"
+          kubectl cluster-info || true
 
       - name: Apply Kubernetes manifests
         run: |
