@@ -19,7 +19,7 @@ spec:
         - name: nexus-regcred
       containers:
         - name: todo-api
-          image: ec2-34-228-135-216.compute-1.amazonaws.com:8083/todo-api:latest
+          image: ec2-32-195-102-168.compute-1.amazonaws.com:8083/todo-api:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 5000
