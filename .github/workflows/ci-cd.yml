@@ -108,6 +108,21 @@ jobs:
         with:
           version: v1.30.0
 
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          CURRENT_CONTEXT="$(kubectl config current-context)"
+          CURRENT_CLUSTER="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="'"$CURRENT_CONTEXT"'")].context.cluster}')"
+          API_SERVER="$(kubectl config view -o jsonpath='{.clusters[?(@.name=="'"$CURRENT_CLUSTER"'")].cluster.server}')"
+          HTTP_API_SERVER="${API_SERVER/https:\/\//http://}"
+          kubectl config set-cluster "$CURRENT_CLUSTER" --server="$HTTP_API_SERVER"
+          kubectl config set-cluster "$CURRENT_CLUSTER" --insecure-skip-tls-verify=true
+          kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority-data" || true
+          kubectl config unset "clusters.$CURRENT_CLUSTER.cluster.certificate-authority" || true
+          echo "Kubernetes API server configured as: $HTTP_API_SERVER"
+
       - name: Validate Kubernetes manifests
         run: |
           kubectl apply --dry-run=client --validate=false -f k8s/namespace.yaml
